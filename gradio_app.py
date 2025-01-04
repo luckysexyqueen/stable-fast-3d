@@ -1,6 +1,7 @@
 import os
 import tempfile
 import time
+from contextlib import nullcontext
 from functools import lru_cache
 from typing import Any
 
@@ -11,8 +12,12 @@ import torch
 from gradio_litmodel3d import LitModel3D
 from PIL import Image
 
+os.system("USE_CUDA=1 pip install -vv --no-build-isolation ./texture_baker ./uv_unwrapper")
+
 import sf3d.utils as sf3d_utils
 from sf3d.system import SF3D
+
+os.environ["GRADIO_TEMP_DIR"] = os.path.join(os.environ.get("TMPDIR", "/tmp"), "gradio")
 
 rembg_session = rembg.new_session()
 
@@ -28,32 +33,48 @@ intrinsic, intrinsic_normed_cond = sf3d_utils.create_intrinsic_from_fov_deg(
     COND_FOVY_DEG, COND_HEIGHT, COND_WIDTH
 )
 
+generated_files = []
+
+# Delete previous gradio temp dir folder
+if os.path.exists(os.environ["GRADIO_TEMP_DIR"]):
+    print(f"Deleting {os.environ['GRADIO_TEMP_DIR']}")
+    import shutil
+
+    shutil.rmtree(os.environ["GRADIO_TEMP_DIR"])
+
+device = sf3d_utils.get_device()
 
 model = SF3D.from_pretrained(
     "stabilityai/stable-fast-3d",
     config_name="config.yaml",
     weight_name="model.safetensors",
 )
-model.eval().cuda()
+model.eval()
+model = model.to(device)
 
 example_files = [
     os.path.join("demo_files/examples", f) for f in os.listdir("demo_files/examples")
 ]
 
 
-def run_model(input_image):
+def run_model(input_image, remesh_option, vertex_count, texture_size):
     start = time.time()
     with torch.no_grad():
-        with torch.autocast(device_type="cuda", dtype=torch.float16):
+        with torch.autocast(
+            device_type=device, dtype=torch.bfloat16
+        ) if "cuda" in device else nullcontext():
             model_batch = create_batch(input_image)
-            model_batch = {k: v.cuda() for k, v in model_batch.items()}
-            trimesh_mesh, _glob_dict = model.generate_mesh(model_batch, 1024)
+            model_batch = {k: v.to(device) for k, v in model_batch.items()}
+            trimesh_mesh, _glob_dict = model.generate_mesh(
+                model_batch, texture_size, remesh_option, vertex_count
+            )
             trimesh_mesh = trimesh_mesh[0]
 
     # Create new tmp file
     tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".glb")
 
     trimesh_mesh.export(tmp_file.name, file_type="glb", include_normals=True)
+    generated_files.append(tmp_file.name)
 
     print("Generation took:", time.time() - start, "s")
 
@@ -104,61 +125,6 @@ def remove_background(input_image: Image) -> Image:
     return rembg.remove(input_image, session=rembg_session)
 
 
-def resize_foreground(
-    image: Image,
-    ratio: float,
-) -> Image:
-    image = np.array(image)
-    assert image.shape[-1] == 4
-    alpha = np.where(image[..., 3] > 0)
-    y1, y2, x1, x2 = (
-        alpha[0].min(),
-        alpha[0].max(),
-        alpha[1].min(),
-        alpha[1].max(),
-    )
-    # crop the foreground
-    fg = image[y1:y2, x1:x2]
-    # pad to square
-    size = max(fg.shape[0], fg.shape[1])
-    ph0, pw0 = (size - fg.shape[0]) // 2, (size - fg.shape[1]) // 2
-    ph1, pw1 = size - fg.shape[0] - ph0, size - fg.shape[1] - pw0
-    new_image = np.pad(
-        fg,
-        ((ph0, ph1), (pw0, pw1), (0, 0)),
-        mode="constant",
-        constant_values=((0, 0), (0, 0), (0, 0)),
-    )
-
-    # compute padding according to the ratio
-    new_size = int(new_image.shape[0] / ratio)
-    # pad to size, double side
-    ph0, pw0 = (new_size - size) // 2, (new_size - size) // 2
-    ph1, pw1 = new_size - size - ph0, new_size - size - pw0
-    new_image = np.pad(
-        new_image,
-        ((ph0, ph1), (pw0, pw1), (0, 0)),
-        mode="constant",
-        constant_values=((0, 0), (0, 0), (0, 0)),
-    )
-    new_image = Image.fromarray(new_image, mode="RGBA").resize(
-        (COND_WIDTH, COND_HEIGHT)
-    )
-    return new_image
-
-
-def square_crop(input_image: Image) -> Image:
-    # Perform a center square crop
-    min_size = min(input_image.size)
-    left = (input_image.size[0] - min_size) // 2
-    top = (input_image.size[1] - min_size) // 2
-    right = (input_image.size[0] + min_size) // 2
-    bottom = (input_image.size[1] + min_size) // 2
-    return input_image.crop((left, top, right, bottom)).resize(
-        (COND_WIDTH, COND_HEIGHT)
-    )
-
-
 def show_mask_img(input_image: Image) -> Image:
     img_numpy = np.array(input_image)
     alpha = img_numpy[:, :, 3] / 255.0
@@ -167,9 +133,27 @@ def show_mask_img(input_image: Image) -> Image:
     return Image.fromarray(new_img.astype(np.uint8), mode="RGB")
 
 
-def run_button(run_btn, input_image, background_state, foreground_ratio):
+def run_button(
+    run_btn,
+    input_image,
+    background_state,
+    foreground_ratio,
+    remesh_option,
+    vertex_count,
+    texture_size,
+):
     if run_btn == "Run":
-        glb_file: str = run_model(background_state)
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        glb_file: str = run_model(
+            background_state, remesh_option.lower(), vertex_count, texture_size
+        )
+        if torch.cuda.is_available():
+            print("Peak Memory:", torch.cuda.max_memory_allocated() / 1024 / 1024, "MB")
+        elif torch.backends.mps.is_available():
+            print(
+                "Peak Memory:", torch.mps.driver_allocated_memory() / 1024 / 1024, "MB"
+            )
 
         return (
             gr.update(),
@@ -182,12 +166,13 @@ def run_button(run_btn, input_image, background_state, foreground_ratio):
     elif run_btn == "Remove Background":
         rem_removed = remove_background(input_image)
 
-        sqr_crop = square_crop(rem_removed)
-        fr_res = resize_foreground(sqr_crop, foreground_ratio)
+        fr_res = sf3d_utils.resize_foreground(
+            rem_removed, foreground_ratio, out_size=(COND_WIDTH, COND_HEIGHT)
+        )
 
         return (
             gr.update(value="Run", visible=True),
-            sqr_crop,
+            rem_removed,
             fr_res,
             gr.update(value=show_mask_img(fr_res), visible=True),
             gr.update(value=None, visible=False),
@@ -210,11 +195,12 @@ def requires_bg_remove(image, fr):
 
     if min_alpha == 0:
         print("Already has alpha")
-        sqr_crop = square_crop(image)
-        fr_res = resize_foreground(sqr_crop, fr)
+        fr_res = sf3d_utils.resize_foreground(
+            image, foreground_ratio, out_size=(COND_WIDTH, COND_HEIGHT)
+        )
         return (
             gr.update(value="Run", visible=True),
-            sqr_crop,
+            image,
             fr_res,
             gr.update(value=show_mask_img(fr_res), visible=True),
             gr.update(visible=False),
@@ -231,7 +217,9 @@ def requires_bg_remove(image, fr):
 
 
 def update_foreground_ratio(img_proc, fr):
-    foreground_res = resize_foreground(img_proc, fr)
+    foreground_res = sf3d_utils.resize_foreground(
+        img_proc, fr, out_size=(COND_WIDTH, COND_HEIGHT)
+    )
     return (
         foreground_res,
         gr.update(value=show_mask_img(foreground_res)),
@@ -250,7 +238,8 @@ with gr.Blocks() as demo:
     **Tips**
     1. If the image already has an alpha channel, you can skip the background removal step.
     2. You can adjust the foreground ratio to control the size of the foreground object. This can influence the shape
-    3. You can upload your own HDR environment map to light the 3D model.
+    3. You can select the remeshing option to control the mesh topology. This can introduce artifacts in the mesh on thin surfaces and should be turned off in such cases.
+    4. You can upload your own HDR environment map to light the 3D model.
     """)
     with gr.Row(variant="panel"):
         with gr.Column():
@@ -278,6 +267,30 @@ with gr.Blocks() as demo:
                 update_foreground_ratio,
                 inputs=[img_proc_state, foreground_ratio],
                 outputs=[background_remove_state, preview_removal],
+            )
+
+            remesh_option = gr.Radio(
+                choices=["None", "Triangle", "Quad"],
+                label="Remeshing",
+                value="None",
+                visible=True,
+            )
+
+            vertex_count_slider = gr.Slider(
+                label="Target Vertex Count",
+                minimum=-1,
+                maximum=20000,
+                value=-1,
+                visible=True,
+            )
+
+            texture_size = gr.Slider(
+                label="Texture Size",
+                minimum=512,
+                maximum=2048,
+                value=1024,
+                step=256,
+                visible=True,
             )
 
             run_btn = gr.Button("Run", variant="primary", visible=False)
@@ -341,6 +354,9 @@ with gr.Blocks() as demo:
             input_img,
             background_remove_state,
             foreground_ratio,
+            remesh_option,
+            vertex_count_slider,
+            texture_size,
         ],
         outputs=[
             run_btn,
@@ -352,4 +368,4 @@ with gr.Blocks() as demo:
         ],
     )
 
-demo.launch()
+demo.queue().launch(share=False)

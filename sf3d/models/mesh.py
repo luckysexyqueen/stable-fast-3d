@@ -1,14 +1,29 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, Optional
 
+import gpytoolbox
+import numpy as np
+import pynanoinstantmeshes
 import torch
 import torch.nn.functional as F
+import trimesh
 from jaxtyping import Float, Integer
 from torch import Tensor
 
-from sf3d.box_uv_unwrap import box_projection_uv_unwrap
 from sf3d.models.utils import dot
+
+try:
+    from uv_unwrapper import Unwrapper
+except ImportError:
+    import logging
+
+    logging.warning(
+        "Could not import uv_unwrapper. Please install it via `pip install uv_unwrapper/`"
+    )
+    # Exit early to avoid further errors
+    raise ImportError("uv_unwrapper not found")
 
 
 class Mesh:
@@ -24,6 +39,8 @@ class Mesh:
         self.extras: Dict[str, Any] = {}
         for k, v in kwargs.items():
             self.add_extra(k, v)
+
+        self.unwrapper = Unwrapper()
 
     def add_extra(self, k, v) -> None:
         self.extras[k] = v
@@ -131,12 +148,112 @@ class Mesh:
 
         return tangents
 
+    def quad_remesh(
+        self,
+        quad_vertex_count: int = -1,
+        quad_rosy: int = 4,
+        quad_crease_angle: float = -1.0,
+        quad_smooth_iter: int = 2,
+        quad_align_to_boundaries: bool = False,
+    ) -> Mesh:
+        if quad_vertex_count < 0:
+            quad_vertex_count = self.v_pos.shape[0]
+        v_pos = self.v_pos.detach().cpu().numpy().astype(np.float32)
+        t_pos_idx = self.t_pos_idx.detach().cpu().numpy().astype(np.uint32)
+
+        new_vert, new_faces = pynanoinstantmeshes.remesh(
+            v_pos,
+            t_pos_idx,
+            quad_vertex_count // 4,
+            rosy=quad_rosy,
+            posy=4,
+            creaseAngle=quad_crease_angle,
+            align_to_boundaries=quad_align_to_boundaries,
+            smooth_iter=quad_smooth_iter,
+            deterministic=False,
+        )
+
+        # Briefly load in trimesh
+        mesh = trimesh.Trimesh(vertices=new_vert, faces=new_faces.astype(np.int32))
+
+        v_pos = torch.from_numpy(mesh.vertices).to(self.v_pos).contiguous()
+        t_pos_idx = torch.from_numpy(mesh.faces).to(self.t_pos_idx).contiguous()
+
+        # Create new mesh
+        return Mesh(v_pos, t_pos_idx)
+
+    def triangle_remesh(
+        self,
+        triangle_average_edge_length_multiplier: Optional[float] = None,
+        triangle_remesh_steps: int = 10,
+        triangle_vertex_count=-1,
+    ):
+        if triangle_vertex_count > 0:
+            reduction = triangle_vertex_count / self.v_pos.shape[0]
+            print("Triangle reduction:", reduction)
+            v_pos = self.v_pos.detach().cpu().numpy().astype(np.float32)
+            t_pos_idx = self.t_pos_idx.detach().cpu().numpy().astype(np.int32)
+            if reduction > 1.0:
+                subdivide_iters = int(math.ceil(math.log(reduction) / math.log(2)))
+                print("Subdivide iters:", subdivide_iters)
+                v_pos, t_pos_idx = gpytoolbox.subdivide(
+                    v_pos,
+                    t_pos_idx,
+                    iters=subdivide_iters,
+                )
+                reduction = triangle_vertex_count / v_pos.shape[0]
+
+            # Simplify
+            points_out, faces_out, _, _ = gpytoolbox.decimate(
+                v_pos,
+                t_pos_idx,
+                face_ratio=reduction,
+            )
+
+            # Convert back to torch
+            self.v_pos = torch.from_numpy(points_out).to(self.v_pos)
+            self.t_pos_idx = torch.from_numpy(faces_out).to(self.t_pos_idx)
+            self._edges = None
+            triangle_average_edge_length_multiplier = None
+
+        edges = self.edges
+        if triangle_average_edge_length_multiplier is None:
+            h = None
+        else:
+            h = float(
+                torch.linalg.norm(
+                    self.v_pos[edges[:, 0]] - self.v_pos[edges[:, 1]], dim=1
+                )
+                .mean()
+                .item()
+                * triangle_average_edge_length_multiplier
+            )
+
+        # Convert to numpy
+        v_pos = self.v_pos.detach().cpu().numpy().astype(np.float64)
+        t_pos_idx = self.t_pos_idx.detach().cpu().numpy().astype(np.int32)
+
+        # Remesh
+        v_remesh, f_remesh = gpytoolbox.remesh_botsch(
+            v_pos,
+            t_pos_idx,
+            triangle_remesh_steps,
+            h,
+        )
+
+        # Convert back to torch
+        v_pos = torch.from_numpy(v_remesh).to(self.v_pos).contiguous()
+        t_pos_idx = torch.from_numpy(f_remesh).to(self.t_pos_idx).contiguous()
+
+        # Create new mesh
+        return Mesh(v_pos, t_pos_idx)
+
     @torch.no_grad()
     def unwrap_uv(
         self,
         island_padding: float = 0.02,
     ) -> Mesh:
-        uv, indices = box_projection_uv_unwrap(
+        uv, indices = self.unwrapper(
             self.v_pos, self.v_nrm, self.t_pos_idx, island_padding
         )
 

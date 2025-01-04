@@ -1,6 +1,7 @@
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -21,15 +22,23 @@ from sf3d.models.utils import (
     ImageProcessor,
     convert_data,
     dilate_fill,
-    dot,
     find_class,
     float32_to_uint8_np,
     normalize,
     scale_tensor,
 )
-from sf3d.utils import create_intrinsic_from_fov_deg, default_cond_c2w
+from sf3d.utils import create_intrinsic_from_fov_deg, default_cond_c2w, get_device
 
-from .texture_baker import TextureBaker
+try:
+    from texture_baker import TextureBaker
+except ImportError:
+    import logging
+
+    logging.warning(
+        "Could not import texture_baker. Please install it via `pip install texture-baker/`"
+    )
+    # Exit early to avoid further errors
+    raise ImportError("texture_baker not found")
 
 
 class SF3D(BaseModule):
@@ -206,6 +215,7 @@ class SF3D(BaseModule):
             batch["c2w_cond"] = batch["c2w_cond"].unsqueeze(1)
             batch["intrinsic_cond"] = batch["intrinsic_cond"].unsqueeze(1)
             batch["intrinsic_normed_cond"] = batch["intrinsic_normed_cond"].unsqueeze(1)
+
         batch_size, n_input_views = batch["rgb_cond"].shape[:2]
 
         camera_embeds: Optional[Float[Tensor, "B Nv Cc"]]
@@ -234,10 +244,54 @@ class SF3D(BaseModule):
 
     def run_image(
         self,
-        image: Image,
+        image: Union[Image.Image, List[Image.Image]],
         bake_resolution: int,
+        remesh: Literal["none", "triangle", "quad"] = "none",
+        vertex_count: int = -1,
         estimate_illumination: bool = False,
-    ) -> Tuple[trimesh.Trimesh, dict[str, Any]]:
+    ) -> Tuple[Union[trimesh.Trimesh, List[trimesh.Trimesh]], dict[str, Any]]:
+        if isinstance(image, list):
+            rgb_cond = []
+            mask_cond = []
+            for img in image:
+                mask, rgb = self.prepare_image(img)
+                mask_cond.append(mask)
+                rgb_cond.append(rgb)
+            rgb_cond = torch.stack(rgb_cond, 0)
+            mask_cond = torch.stack(mask_cond, 0)
+            batch_size = rgb_cond.shape[0]
+        else:
+            mask_cond, rgb_cond = self.prepare_image(image)
+            batch_size = 1
+
+        c2w_cond = default_cond_c2w(self.cfg.default_distance).to(self.device)
+        intrinsic, intrinsic_normed_cond = create_intrinsic_from_fov_deg(
+            self.cfg.default_fovy_deg,
+            self.cfg.cond_image_size,
+            self.cfg.cond_image_size,
+        )
+
+        batch = {
+            "rgb_cond": rgb_cond,
+            "mask_cond": mask_cond,
+            "c2w_cond": c2w_cond.view(1, 1, 4, 4).repeat(batch_size, 1, 1, 1),
+            "intrinsic_cond": intrinsic.to(self.device)
+            .view(1, 1, 3, 3)
+            .repeat(batch_size, 1, 1, 1),
+            "intrinsic_normed_cond": intrinsic_normed_cond.to(self.device)
+            .view(1, 1, 3, 3)
+            .repeat(batch_size, 1, 1, 1),
+        }
+
+        meshes, global_dict = self.generate_mesh(
+            batch, bake_resolution, remesh, vertex_count, estimate_illumination
+        )
+        if batch_size == 1:
+            return meshes[0], global_dict
+        else:
+            return meshes, global_dict
+
+    def prepare_image(self, image):
         if image.mode != "RGBA":
             raise ValueError("Image must be in RGBA mode")
         img_cond = (
@@ -258,30 +312,14 @@ class SF3D(BaseModule):
             mask_cond,
         )
 
-        c2w_cond = default_cond_c2w(self.cfg.default_distance).to(self.device)
-        intrinsic, intrinsic_normed_cond = create_intrinsic_from_fov_deg(
-            self.cfg.default_fovy_deg,
-            self.cfg.cond_image_size,
-            self.cfg.cond_image_size,
-        )
-
-        batch = {
-            "rgb_cond": rgb_cond,
-            "mask_cond": mask_cond,
-            "c2w_cond": c2w_cond.unsqueeze(0),
-            "intrinsic_cond": intrinsic.to(self.device).unsqueeze(0),
-            "intrinsic_normed_cond": intrinsic_normed_cond.to(self.device).unsqueeze(0),
-        }
-
-        meshes, global_dict = self.generate_mesh(
-            batch, bake_resolution, estimate_illumination
-        )
-        return meshes[0], global_dict
+        return mask_cond, rgb_cond
 
     def generate_mesh(
         self,
         batch,
         bake_resolution: int,
+        remesh: Literal["none", "triangle", "quad"] = "none",
+        vertex_count: int = -1,
         estimate_illumination: bool = False,
     ) -> Tuple[List[trimesh.Trimesh], dict[str, Any]]:
         batch["rgb_cond"] = self.image_processor(
@@ -300,8 +338,11 @@ class SF3D(BaseModule):
         if self.global_estimator is not None and estimate_illumination:
             global_dict.update(self.global_estimator(non_postprocessed_codes))
 
+        device = get_device()
         with torch.no_grad():
-            with torch.autocast(device_type="cuda", enabled=False):
+            with torch.autocast(
+                device_type=device, enabled=False
+            ) if "cuda" in device else nullcontext():
                 meshes = self.triplane_to_meshes(scene_codes)
 
                 rets = []
@@ -311,6 +352,17 @@ class SF3D(BaseModule):
                         rets.append(trimesh.Trimesh())
                         continue
 
+                    if remesh == "triangle":
+                        mesh = mesh.triangle_remesh(triangle_vertex_count=vertex_count)
+                    elif remesh == "quad":
+                        mesh = mesh.quad_remesh(quad_vertex_count=vertex_count)
+                    else:
+                        if vertex_count > 0:
+                            print(
+                                "Warning: vertex_count is ignored when remesh is none"
+                            )
+
+                    print("After Remesh", mesh.v_pos.shape[0], mesh.t_pos_idx.shape[0])
                     mesh.unwrap_uv()
 
                     # Build textures
@@ -323,7 +375,6 @@ class SF3D(BaseModule):
                         mesh.v_pos,
                         rast,
                         mesh.t_pos_idx,
-                        mesh.v_tex,
                     )
                     gb_pos = pos_bake[bake_mask]
 
@@ -336,7 +387,6 @@ class SF3D(BaseModule):
                         mesh.v_nrm,
                         rast,
                         mesh.t_pos_idx,
-                        mesh.v_tex,
                     )
                     gb_nrm = F.normalize(nrm[bake_mask], dim=-1)
                     decoded["normal"] = gb_nrm
@@ -377,29 +427,28 @@ class SF3D(BaseModule):
                                     mesh.v_tng,
                                     rast,
                                     mesh.t_pos_idx,
-                                    mesh.v_tex,
                                 )
                                 gb_tng = tng[bake_mask]
                                 gb_tng = F.normalize(gb_tng, dim=-1)
                                 gb_btng = F.normalize(
-                                    torch.cross(gb_tng, gb_nrm, dim=-1), dim=-1
+                                    torch.cross(gb_nrm, gb_tng, dim=-1), dim=-1
                                 )
                                 normal = F.normalize(mat_out["normal"], dim=-1)
 
-                                bump = torch.cat(
-                                    # Check if we have to flip some things
-                                    (
-                                        dot(normal, gb_tng),
-                                        dot(normal, gb_btng),
-                                        dot(normal, gb_nrm).clip(
-                                            0.3, 1
-                                        ),  # Never go below 0.3. This would indicate a flipped (or close to one) normal
-                                    ),
-                                    -1,
+                                # Create tangent space matrix and transform normal
+                                tangent_matrix = torch.stack(
+                                    [gb_tng, gb_btng, gb_nrm], dim=-1
                                 )
-                                bump = (bump * 0.5 + 0.5).clamp(0, 1)
+                                normal_tangent = torch.bmm(
+                                    tangent_matrix.transpose(1, 2), normal.unsqueeze(-1)
+                                ).squeeze(-1)
 
-                                f[bake_mask] = bump.view(-1, 3)
+                                # Convert from [-1,1] to [0,1] range for storage
+                                normal_tangent = (normal_tangent * 0.5 + 0.5).clamp(
+                                    0, 1
+                                )
+
+                                f[bake_mask] = normal_tangent.view(-1, 3)
                                 mat_out["bump"] = f
                             else:
                                 f[bake_mask] = v.view(-1, v.shape[-1])
@@ -410,12 +459,13 @@ class SF3D(BaseModule):
                             return arr
                         return (
                             dilate_fill(
-                                arr.permute(2, 0, 1)[None, ...],
+                                arr.permute(2, 0, 1)[None, ...].contiguous(),
                                 bake_mask.unsqueeze(0).unsqueeze(0),
                                 iterations=bake_resolution // 150,
                             )
                             .squeeze(0)
                             .permute(1, 2, 0)
+                            .contiguous()
                         )
 
                     verts_np = convert_data(mesh.v_pos)
