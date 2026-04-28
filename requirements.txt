@@ -16,6 +16,7 @@ pynanoinstantmeshes==0.0.3
 gpytoolbox==0.2.0
 gradio==4.41.0
 gradio_client==1.3.0
+pydantic==2.10.6
 gradio-litmodel3d==0.0.1
 # (HF hack) These are installed at runtime in gradio_app.py
 # ./texture_baker/
