@@ -13,7 +13,10 @@ import torch
 from gradio_litmodel3d import LitModel3D
 from PIL import Image
 
-os.system("USE_CUDA=1 pip install -vv --no-build-isolation ./texture_baker ./uv_unwrapper")
+os.system(
+    'CPPFLAGS="-include utility" TORCH_CUDA_ARCH_LIST="12.0+PTX" USE_CUDA=1 '
+    "pip install -vv --no-build-isolation ./texture_baker ./uv_unwrapper"
+)
 
 import sf3d.utils as sf3d_utils
 from sf3d.system import SF3D
