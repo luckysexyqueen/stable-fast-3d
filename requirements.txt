@@ -1,7 +1,7 @@
 wheel
 setuptools==69.5.1
-torch==2.5.1
-torchvision==0.20.1
+torch==2.8.0
+torchvision==0.23.0
 einops==0.7.0
 jaxtyping==0.2.31
 omegaconf==2.3.0
