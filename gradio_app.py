@@ -1,3 +1,4 @@
+import spaces
 import os
 import tempfile
 import time
@@ -132,7 +133,7 @@ def show_mask_img(input_image: Image) -> Image:
     new_img = img_numpy[..., :3] * alpha[:, :, None] + chkb * (1 - alpha[:, :, None])
     return Image.fromarray(new_img.astype(np.uint8), mode="RGB")
 
-
+@spaces.GPU
 def run_button(
     run_btn,
     input_image,
