@@ -61,13 +61,39 @@ example_files = [
 ]
 
 
-def run_model(input_image, remesh_option, vertex_count, texture_size):
+def compose_multi_reference(primary: Image, reference_sheet: Image | None) -> Image:
+    """Build one square RGBA conditioning image from both user references.
+
+    SF3D currently accepts one conditioning image. Keeping both inputs in a
+    deterministic canvas lets the UI use the detailed front image and the
+    multi-view sheet in the same generation request.
+    """
+    primary = primary.convert("RGBA")
+    if reference_sheet is None:
+        return primary
+
+    reference_sheet = reference_sheet.convert("RGBA")
+    canvas = Image.new("RGBA", (COND_WIDTH * 2, COND_HEIGHT), (255, 255, 255, 255))
+    left = sf3d_utils.resize_foreground(primary, 0.92, out_size=(COND_WIDTH, COND_HEIGHT))
+    right = reference_sheet.copy()
+    right.thumbnail((COND_WIDTH - 16, COND_HEIGHT - 16), Image.Resampling.LANCZOS)
+    right_canvas = Image.new("RGBA", (COND_WIDTH, COND_HEIGHT), (255, 255, 255, 255))
+    right_canvas.alpha_composite(
+        right, ((COND_WIDTH - right.width) // 2, (COND_HEIGHT - right.height) // 2)
+    )
+    canvas.alpha_composite(left, (0, 0))
+    canvas.alpha_composite(right_canvas, (COND_WIDTH, 0))
+    return canvas
+
+
+def run_model(input_image, reference_sheet, remesh_option, vertex_count, texture_size):
     start = time.time()
     with torch.no_grad():
         with torch.autocast(
             device_type=device, dtype=torch.bfloat16
         ) if "cuda" in device else nullcontext():
-            model_batch = create_batch(input_image)
+            conditioning_image = compose_multi_reference(input_image, reference_sheet)
+            model_batch = create_batch(conditioning_image)
             model_batch = {k: v.to(device) for k, v in model_batch.items()}
             trimesh_mesh, _glob_dict = model.generate_mesh(
                 model_batch, texture_size, remesh_option, vertex_count
@@ -140,6 +166,7 @@ def show_mask_img(input_image: Image) -> Image:
 def run_button(
     run_btn,
     input_image,
+    reference_sheet,
     background_state,
     foreground_ratio,
     remesh_option,
@@ -150,7 +177,11 @@ def run_button(
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         glb_file: str = run_model(
-            background_state, remesh_option.lower(), vertex_count, texture_size
+            background_state,
+            reference_sheet,
+            remesh_option.lower(),
+            vertex_count,
+            texture_size,
         )
         if torch.cuda.is_available():
             print("Peak Memory:", torch.cuda.max_memory_allocated() / 1024 / 1024, "MB")
@@ -250,6 +281,12 @@ with gr.Blocks() as demo:
             with gr.Row():
                 input_img = gr.Image(
                     type="pil", label="Input Image", sources="upload", image_mode="RGBA"
+                )
+                reference_sheet_img = gr.Image(
+                    type="pil",
+                    label="Additional Multi-View Reference (optional)",
+                    sources="upload",
+                    image_mode="RGBA",
                 )
                 preview_removal = gr.Image(
                     label="Preview Background Removal",
@@ -356,6 +393,7 @@ with gr.Blocks() as demo:
         inputs=[
             run_btn,
             input_img,
+            reference_sheet_img,
             background_remove_state,
             foreground_ratio,
             remesh_option,
